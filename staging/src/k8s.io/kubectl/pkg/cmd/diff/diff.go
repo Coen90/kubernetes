@@ -376,6 +376,65 @@ func (obj InfoObject) Merged() (runtime.Object, error) {
 		)
 	}
 
+	// Check if the last-applied-configuration annotation exists
+	original, err := util.GetOriginalConfiguration(obj.Info.Object)
+	if err != nil {
+		return nil, fmt.Errorf("error retrieving original configuration: %w", err)
+	}
+
+	// If annotation doesn't exist (e.g., resource created with kubectl create),
+	// we need to use a different approach to compute the diff.
+	if original == nil || len(original) == 0 {
+		// Print warning to inform the user about the limitation
+		fmt.Fprintf(obj.ErrOut,
+			"Warning: %s/%s does not have the kubectl.kubernetes.io/last-applied-configuration annotation.\n"+
+				"kubectl diff may show differences in fields that were set by server-side defaults or mutating webhooks.\n"+
+				"For better diff accuracy, use 'kubectl apply' or 'kubectl create --save-config' when creating resources.\n\n",
+			obj.Info.Namespace,
+			obj.Info.Name,
+		)
+
+		// Without the annotation, we cannot perform proper three-way merge.
+		// Instead, we'll create a temporary annotation using the current live state
+		// to enable diff functionality. This is a two-way comparison (live vs. modified).
+		tempObj := obj.Info.Object.DeepCopyObject()
+
+		// Create a temporary annotation with the current live state
+		if err := util.CreateApplyAnnotation(tempObj, unstructured.UnstructuredJSONScheme); err != nil {
+			return nil, fmt.Errorf("error creating temporary annotation for diff: %w", err)
+		}
+
+		modified, err := util.GetModifiedConfiguration(obj.LocalObj, false, unstructured.UnstructuredJSONScheme)
+		if err != nil {
+			return nil, err
+		}
+
+		var resourceVersion *string
+		if !obj.Force {
+			accessor, err := meta.Accessor(tempObj)
+			if err != nil {
+				return nil, err
+			}
+			str := accessor.GetResourceVersion()
+			resourceVersion = &str
+		}
+
+		// Use patcher with the temporary annotation
+		patcher := &apply.Patcher{
+			Mapping:         obj.Info.Mapping,
+			Helper:          helper,
+			Overwrite:       true, // Important: overwrite to detect all changes including deletions
+			BackOff:         clockwork.NewRealClock(),
+			OpenAPIGetter:   obj.OpenAPIGetter,
+			OpenAPIV3Root:   obj.OpenAPIV3Root,
+			ResourceVersion: resourceVersion,
+		}
+
+		_, result, err := patcher.Patch(tempObj, modified, obj.Info.Source, obj.Info.Namespace, obj.Info.Name, obj.ErrOut)
+		return result, err
+	}
+
+	// If annotation exists, proceed with the normal three-way merge
 	var resourceVersion *string
 	if !obj.Force {
 		accessor, err := meta.Accessor(obj.Info.Object)

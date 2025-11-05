@@ -69,6 +69,162 @@ run_kubectl_diff_tests() {
     # Cleanup
     kubectl delete -f hack/testdata/pod.yaml
 
+    kube::log::status "Testing kubectl diff after kubectl create (Bug #1587)"
+
+    # Test that kubectl diff detects deletions even when resource was created with kubectl create
+    # (without the last-applied-configuration annotation)
+
+    # Create a deployment with env vars using kubectl create (without --save-config)
+    kubectl create -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-diff-deployment
+  labels:
+    app: test-diff
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-diff
+  template:
+    metadata:
+      labels:
+        app: test-diff
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.14
+        env:
+        - name: TESTENV1
+          value: "var1"
+        - name: TESTENV2
+          value: "var2"
+EOF
+
+    kube::test::get_object_assert 'deployment test-diff-deployment' "{{.metadata.name}}" 'test-diff-deployment'
+
+    # Verify that the deployment does NOT have the last-applied-configuration annotation
+    output=$(kubectl get deployment test-diff-deployment -o jsonpath='{.metadata.annotations}' 2>&1 || true)
+    kube::test::if_has_not_string "${output}" 'kubectl.kubernetes.io/last-applied-configuration'
+
+    # Now test diff with a modified manifest that:
+    # 1. Deletes TESTENV1
+    # 2. Changes TESTENV2 value
+    # This should detect BOTH changes (the deletion AND the value change)
+    output_message=$(kubectl diff -f - 2>&1 <<EOF || test \$? -eq 1
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-diff-deployment
+  labels:
+    app: test-diff
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-diff
+  template:
+    metadata:
+      labels:
+        app: test-diff
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.14
+        env:
+        - name: TESTENV2
+          value: "modified"
+EOF
+)
+
+    # Should show the warning about missing annotation
+    kube::test::if_has_string "${output_message}" 'Warning'
+    kube::test::if_has_string "${output_message}" 'last-applied-configuration'
+
+    # IMPORTANT: Should now detect the deletion of TESTENV1
+    kube::test::if_has_string "${output_message}" 'TESTENV1'
+
+    # Should also detect the value change of TESTENV2
+    kube::test::if_has_string "${output_message}" 'TESTENV2'
+    kube::test::if_has_string "${output_message}" 'modified'
+
+    # Cleanup
+    kubectl delete deployment test-diff-deployment
+
+    kube::log::status "Testing kubectl diff after kubectl create --save-config"
+
+    # Test that it works correctly when --save-config is used
+    kubectl create --save-config -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-diff-deployment-saved
+  labels:
+    app: test-diff-saved
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-diff-saved
+  template:
+    metadata:
+      labels:
+        app: test-diff-saved
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.14
+        env:
+        - name: TESTENV1
+          value: "var1"
+        - name: TESTENV2
+          value: "var2"
+EOF
+
+    kube::test::get_object_assert 'deployment test-diff-deployment-saved' "{{.metadata.name}}" 'test-diff-deployment-saved'
+
+    # Verify that the annotation EXISTS when --save-config is used
+    output=$(kubectl get deployment test-diff-deployment-saved -o jsonpath='{.metadata.annotations}')
+    kube::test::if_has_string "${output}" 'kubectl.kubernetes.io/last-applied-configuration'
+
+    # Test diff with deletion - should work without warning since annotation exists
+    output_message=$(kubectl diff -f - 2>&1 <<EOF || test \$? -eq 1
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-diff-deployment-saved
+  labels:
+    app: test-diff-saved
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-diff-saved
+  template:
+    metadata:
+      labels:
+        app: test-diff-saved
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.14
+        env:
+        - name: TESTENV2
+          value: "modified"
+EOF
+)
+
+    # Should NOT show warning since annotation exists
+    kube::test::if_has_not_string "${output_message}" 'Warning.*last-applied-configuration'
+
+    # Should detect the deletion
+    kube::test::if_has_string "${output_message}" 'TESTENV1'
+    kube::test::if_has_string "${output_message}" 'TESTENV2'
+
+    # Cleanup
+    kubectl delete deployment test-diff-deployment-saved
+
     kube::log::status "Testing kubectl diff with server-side apply"
 
     # Test that kubectl diff --server-side works when the live object doesn't exist
